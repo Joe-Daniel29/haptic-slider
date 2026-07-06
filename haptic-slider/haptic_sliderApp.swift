@@ -6,10 +6,12 @@
 //
 
 import SwiftUI
+import AppKit
 
 @main
 struct haptic_sliderApp: App {
-    @StateObject private var engine = HapticEngine()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var engine = HapticEngine.shared
     @AppStorage("menuIcon") private var menuIcon = "hand.point.up.braille"
 
     var body: some Scene {
@@ -25,5 +27,60 @@ struct haptic_sliderApp: App {
     private var safeIcon: String {
         NSImage(systemSymbolName: menuIcon, accessibilityDescription: nil) != nil
             ? menuIcon : "hand.point.up.braille"
+    }
+}
+
+/// Enforces a single running instance and shows a first-run welcome window so the app
+/// never appears to "launch into nothing" (it's a menu-bar agent with no main window).
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+    private var welcomeWindow: NSWindow?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Idempotent launch: if another copy is already running, focus it and quit.
+        let me = NSRunningApplication.current
+        let others = NSRunningApplication
+            .runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            .filter { $0.processIdentifier != me.processIdentifier }
+        if let existing = others.first {
+            existing.activate()
+            NSApp.terminate(nil)
+            return
+        }
+
+        _ = HapticEngine.shared   // spin up the engine
+        if !UserDefaults.standard.bool(forKey: "didOnboard") {
+            // Defer to next runloop tick so the app is ready to front a window.
+            DispatchQueue.main.async { [weak self] in self?.showWelcome() }
+        }
+    }
+
+    /// Show (or re-show) the welcome / setup window. Also reachable from the menu.
+    func showWelcome() {
+        if welcomeWindow == nil {
+            let host = NSHostingController(rootView: WelcomeView { [weak self] in self?.finishOnboarding() })
+            let win = NSWindow(contentViewController: host)
+            win.styleMask = [.titled, .closable, .fullSizeContentView]
+            win.titleVisibility = .hidden
+            win.titlebarAppearsTransparent = true
+            win.isMovableByWindowBackground = true
+            win.isReleasedWhenClosed = false
+            win.delegate = self
+            welcomeWindow = win
+        }
+        // Become a regular app briefly so the window can take focus and come to front.
+        NSApp.setActivationPolicy(.regular)
+        welcomeWindow?.center()
+        welcomeWindow?.makeKeyAndOrderFront(nil)
+        welcomeWindow?.orderFrontRegardless()
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func finishOnboarding() {
+        UserDefaults.standard.set(true, forKey: "didOnboard")
+        welcomeWindow?.close()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)   // back to menu-bar-only, no dock icon
     }
 }

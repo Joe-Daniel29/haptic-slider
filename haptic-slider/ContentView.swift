@@ -19,6 +19,65 @@ enum Haptics {
     }
 }
 
+/// Private-framework bridge to the Taptic Engine for the REAL force-touch waveforms —
+/// including the deep-click "thud" that the public NSHapticFeedbackManager can't produce.
+/// Reached via MultitouchSupport.framework's MTActuator API (loaded with dlopen so it
+/// works under Apple-Silicon pointer auth). Fully defensive: if anything fails,
+/// `available` is false and callers fall back to the public API — never crashes.
+///
+/// Waveform IDs: 1 weak · 2 strong "Force Touch" click · 3 buzz · 4 light · 5 medium · 6 strong tap.
+final class DeepHaptics {
+    static let shared = DeepHaptics()
+
+    private typealias CreateListFn    = @convention(c) () -> Unmanaged<CFArray>?
+    private typealias CreateActuatorFn = @convention(c) (UInt64) -> UnsafeMutableRawPointer?
+    private typealias OpenFn          = @convention(c) (UnsafeMutableRawPointer) -> Int32
+    private typealias ActuateFn       = @convention(c) (UnsafeMutableRawPointer, Int32, UInt32, Float, Float) -> Int32
+
+    private var actuator: UnsafeMutableRawPointer?
+    private var actuateFn: ActuateFn?
+
+    var available: Bool { actuator != nil && actuateFn != nil }
+
+    private init() { setup() }
+
+    private func setup() {
+        let path = "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport"
+        guard let handle = dlopen(path, RTLD_LAZY),
+              let sList    = dlsym(handle, "MTDeviceCreateList"),
+              let sCreate  = dlsym(handle, "MTActuatorCreateFromDeviceID"),
+              let sOpen    = dlsym(handle, "MTActuatorOpen"),
+              let sActuate = dlsym(handle, "MTActuatorActuate")
+        else { return }
+
+        let createList     = unsafeBitCast(sList,    to: CreateListFn.self)
+        let createActuator = unsafeBitCast(sCreate,  to: CreateActuatorFn.self)
+        let open           = unsafeBitCast(sOpen,    to: OpenFn.self)
+        let actuate        = unsafeBitCast(sActuate, to: ActuateFn.self)
+
+        guard let list = createList()?.takeRetainedValue() else { return }
+        // Pick the first device that actually has an actuator we can open (the trackpad).
+        for i in 0 ..< CFArrayGetCount(list) {
+            guard let devPtr = CFArrayGetValueAtIndex(list, i) else { continue }
+            // MTDeviceGetDeviceID is unstable; the device ID lives at struct offset 64.
+            let deviceID = UnsafeRawPointer(devPtr).loadUnaligned(fromByteOffset: 64, as: UInt64.self)
+            guard let act = createActuator(deviceID) else { continue }
+            if open(act) == 0 {   // kIOReturnSuccess
+                actuator = act
+                actuateFn = actuate
+                return
+            }
+        }
+    }
+
+    /// Play a raw waveform. Returns false if the private API is unavailable.
+    @discardableResult
+    func actuate(_ waveformID: Int32) -> Bool {
+        guard let act = actuator, let fn = actuateFn else { return false }
+        return fn(act, waveformID, 0, 0, 0) == 0
+    }
+}
+
 /// System-wide slider haptics.
 ///
 /// Per-frame hit-testing loses the slider mid-drag (the cursor sits on the thumb, which
@@ -27,6 +86,8 @@ enum Haptics {
 /// haptic each time the value crosses a detent boundary. Hover detection is event-driven
 /// and throttled, so the app does no work when the mouse is still (near-zero idle energy).
 final class HapticEngine: ObservableObject {
+    static let shared = HapticEngine()
+
     @Published var trusted = AXIsProcessTrusted()
     @Published var engineOn = false
     @Published var status = "idle"
@@ -37,6 +98,14 @@ final class HapticEngine: ObservableObject {
     }
     @Published var detents = 16 {
         didSet { UserDefaults.standard.set(detents, forKey: "detents") }
+    }
+    @Published var endpointPulse = true {
+        didSet { UserDefaults.standard.set(endpointPulse, forKey: "endpointPulse") }
+    }
+    /// Taptic waveform ID for the "hit the wall" pulse at the ends.
+    /// 1 weak · 2 strong Force-Touch click (the deep thud) · 3 buzz · 4 light · 5 medium · 6 strong tap.
+    @Published var endpointStyle = 2 {
+        didSet { UserDefaults.standard.set(endpointStyle, forKey: "endpointStyle") }
     }
 
     /// Persisted user intent (independent of whether we're currently trusted/running).
@@ -52,6 +121,7 @@ final class HapticEngine: ObservableObject {
     private var hoveredSlider: AXUIElement?
     private var activeSlider: AXUIElement?
     private var lastIndex = 0
+    private var atEndpoint = false
     private var minV = 0.0
     private var maxV = 1.0
 
@@ -61,6 +131,8 @@ final class HapticEngine: ObservableObject {
         if let raw = d.object(forKey: "pattern") as? Int,
            let p = NSHapticFeedbackManager.FeedbackPattern(rawValue: raw) { pattern = p }
         if let n = d.object(forKey: "detents") as? Int, n > 0 { detents = n }
+        if let e = d.object(forKey: "endpointPulse") as? Bool { endpointPulse = e }
+        if let s = d.object(forKey: "endpointStyle") as? Int { endpointStyle = s }
 
         // Poll trust so the dot goes green the instant access is granted — and auto-start
         // the engine once we're trusted, if the user left it enabled.
@@ -146,6 +218,7 @@ final class HapticEngine: ObservableObject {
         readRange(slider)
         if let v = readValue(slider) {
             lastIndex = detentIndex(v)
+            atEndpoint = isAtEndpoint(v)   // don't thud just because we grabbed at an end
             valueText = String(format: "%.3f", v)
         }
         status = "🔒 tracking slider"
@@ -155,11 +228,37 @@ final class HapticEngine: ObservableObject {
         guard let slider = activeSlider, let v = readValue(slider) else { return }
         valueText = String(format: "%.3f", v)
         let idx = detentIndex(v)
+
+        // Endpoints (0.000 / max): a firm "thud", fired once on arrival.
+        if endpointPulse && isAtEndpoint(v) {
+            if !atEndpoint {
+                atEndpoint = true
+                lastIndex = idx
+                fireThud()
+                tickCount += 1
+            }
+            return
+        }
+        atEndpoint = false
+
         if idx != lastIndex {
             lastIndex = idx
             Haptics.fire(pattern)
             tickCount += 1
         }
+    }
+
+    private func isAtEndpoint(_ v: Double) -> Bool {
+        let norm = maxV > minV ? (v - minV) / (maxV - minV) : v
+        return norm <= 0.0005 || norm >= 0.9995
+    }
+
+    /// The "hit the wall" feel at 0 / max. Uses the real Taptic waveform (the deep click)
+    /// via the private API; if that's unavailable, falls back to a tight public double-tap.
+    func fireThud() {
+        if DeepHaptics.shared.actuate(Int32(endpointStyle)) { return }
+        Haptics.fire(.alignment)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.010) { Haptics.fire(.alignment) }
     }
 
     private func onUp() {
@@ -280,6 +379,8 @@ struct MenuContent: View {
                 .pickerStyle(.segmented).labelsHidden().fixedSize()
             }
 
+            Toggle("Strong pulse at ends (0 & max)", isOn: $engine.endpointPulse)
+
             Toggle("Launch at login", isOn: $launchAtLogin)
                 .onChange(of: launchAtLogin) { _, on in setLaunchAtLogin(on) }
 
@@ -305,8 +406,12 @@ struct MenuContent: View {
 
             Divider()
 
-            Button("Quit Haptic Slider") { NSApp.terminate(nil) }
-                .keyboardShortcut("q")
+            HStack {
+                Button("Setup Guide") { (NSApp.delegate as? AppDelegate)?.showWelcome() }
+                Spacer()
+                Button("Quit") { NSApp.terminate(nil) }
+                    .keyboardShortcut("q")
+            }
         }
         .padding(14)
         .frame(width: 300)
@@ -320,6 +425,57 @@ struct MenuContent: View {
         } catch {
             launchAtLogin = (SMAppService.mainApp.status == .enabled)
         }
+    }
+}
+
+// MARK: - First-run welcome (so it never "silently" launches into nothing)
+
+struct WelcomeView: View {
+    @ObservedObject var engine = HapticEngine.shared
+    var onDone: () -> Void
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Image(nsImage: NSApp.applicationIconImage)
+                .resizable().frame(width: 76, height: 76)
+
+            VStack(spacing: 4) {
+                Text("Haptic Slider Control").font(.title2.bold())
+                Text("It's now running in your menu bar.").foregroundStyle(.secondary)
+            }
+
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "arrow.up.forward").foregroundStyle(.tint).font(.title3)
+                Text("Look for the braille icon at the **top-right** of your screen. "
+                     + "Click it anytime to change settings or turn it off.")
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.quaternary, in: RoundedRectangle(cornerRadius: 10))
+
+            if engine.trusted {
+                Label("Ready — drag any slider to feel it", systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green).font(.callout)
+            } else {
+                VStack(spacing: 10) {
+                    Text("One quick step to turn it on:").font(.callout).foregroundStyle(.secondary)
+                    Button("Grant Accessibility Access…") { engine.requestTrust() }
+                        .buttonStyle(.borderedProminent).controlSize(.large)
+                    Text("This lets it detect which slider you're dragging. "
+                         + "It never reads your content or keystrokes.")
+                        .font(.caption).foregroundStyle(.tertiary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Button(engine.trusted ? "Done" : "I'll do it later") { onDone() }
+                .keyboardShortcut(.defaultAction)
+        }
+        .padding(28)
+        .frame(width: 380)
     }
 }
 
@@ -353,6 +509,25 @@ struct DiagnosticsView: View {
                 Button("Level")   { Haptics.fire(.levelChange) }
             }
             .buttonStyle(.bordered).controlSize(.small)
+
+            HStack(spacing: 6) {
+                Text("End waveform").font(.caption2).foregroundStyle(.secondary)
+                Picker("", selection: $engine.endpointStyle) {
+                    Text("1 · weak").tag(1)
+                    Text("2 · strong (deep)").tag(2)
+                    Text("3 · buzz").tag(3)
+                    Text("4 · light").tag(4)
+                    Text("5 · medium").tag(5)
+                    Text("6 · strong tap").tag(6)
+                }
+                .labelsHidden().fixedSize().controlSize(.small)
+                Button("Test") { engine.fireThud() }.controlSize(.small)
+            }
+            Text(DeepHaptics.shared.available
+                 ? "Deep haptics: ON (real Taptic waveforms)"
+                 : "Deep haptics: unavailable — using fallback")
+                .font(.caption2)
+                .foregroundStyle(DeepHaptics.shared.available ? .green : .orange)
 
             HStack(spacing: 8) {
                 Toggle("Buzz", isOn: $isBuzzing)
