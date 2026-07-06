@@ -6,19 +6,403 @@
 //
 
 import SwiftUI
+import AppKit
+import ApplicationServices
+import ServiceManagement
+import Combine
 
-struct ContentView: View {
-    var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
-        }
-        .padding()
+/// Thin wrapper around the public Force Touch haptics API.
+/// Only does anything on a Force Touch trackpad / Magic Trackpad 2+ — a mouse feels nothing.
+enum Haptics {
+    static func fire(_ pattern: NSHapticFeedbackManager.FeedbackPattern) {
+        NSHapticFeedbackManager.defaultPerformer.perform(pattern, performanceTime: .default)
     }
 }
 
-#Preview {
-    ContentView()
+/// System-wide slider haptics.
+///
+/// Per-frame hit-testing loses the slider mid-drag (the cursor sits on the thumb, which
+/// reports as an AXGroup). So we detect the AXSlider on *hover*, LOCK its element reference
+/// on mouse-down, and read that locked reference's value for the whole drag — firing one
+/// haptic each time the value crosses a detent boundary. Hover detection is event-driven
+/// and throttled, so the app does no work when the mouse is still (near-zero idle energy).
+final class HapticEngine: ObservableObject {
+    @Published var trusted = AXIsProcessTrusted()
+    @Published var engineOn = false
+    @Published var status = "idle"
+    @Published var valueText = "—"
+    @Published var tickCount = 0
+    @Published var pattern: NSHapticFeedbackManager.FeedbackPattern = .alignment {
+        didSet { UserDefaults.standard.set(pattern.rawValue, forKey: "pattern") }
+    }
+    @Published var detents = 16 {
+        didSet { UserDefaults.standard.set(detents, forKey: "detents") }
+    }
+
+    /// Persisted user intent (independent of whether we're currently trusted/running).
+    private(set) var enabledPref: Bool
+
+    private var trustTimer: Timer?
+    private var lastHover: CFTimeInterval = 0
+    private var monitors: [Any] = []
+
+    private let sysWide = AXUIElementCreateSystemWide()
+    private let axQueue = DispatchQueue(label: "haptic.ax.probe")
+
+    private var hoveredSlider: AXUIElement?
+    private var activeSlider: AXUIElement?
+    private var lastIndex = 0
+    private var minV = 0.0
+    private var maxV = 1.0
+
+    init() {
+        let d = UserDefaults.standard
+        enabledPref = d.object(forKey: "enabled") as? Bool ?? true
+        if let raw = d.object(forKey: "pattern") as? Int,
+           let p = NSHapticFeedbackManager.FeedbackPattern(rawValue: raw) { pattern = p }
+        if let n = d.object(forKey: "detents") as? Int, n > 0 { detents = n }
+
+        // Poll trust so the dot goes green the instant access is granted — and auto-start
+        // the engine once we're trusted, if the user left it enabled.
+        let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            let now = AXIsProcessTrusted()
+            if now != self.trusted { self.trusted = now }
+            if now && self.enabledPref && !self.engineOn { self.start() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        trustTimer = t
+
+        if trusted && enabledPref { start() }
+    }
+
+    /// Triggers the system prompt → System Settings → Privacy & Security → Accessibility.
+    func requestTrust() {
+        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        trusted = AXIsProcessTrustedWithOptions(opts)
+    }
+
+    func setEnabled(_ on: Bool) {
+        enabledPref = on
+        UserDefaults.standard.set(on, forKey: "enabled")
+        on ? start() : stop()
+    }
+
+    func start() {
+        guard trusted else { return }
+        stop(clearPref: false)
+        engineOn = true
+        status = "on — drag a slider"
+        tickCount = 0
+
+        let down = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown) { [weak self] _ in self?.onDown() }
+        let drag = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDragged) { [weak self] _ in self?.onDrag() }
+        let up   = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [weak self] _ in self?.onUp() }
+        let move = NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { [weak self] _ in self?.onMove() }
+        monitors = [down, drag, up, move].compactMap { $0 }
+    }
+
+    func stop(clearPref: Bool = false) {
+        monitors.forEach { NSEvent.removeMonitor($0) }
+        monitors.removeAll()
+        hoveredSlider = nil
+        activeSlider = nil
+        engineOn = false
+        status = "off"
+        valueText = "—"
+        if clearPref { enabledPref = false }
+    }
+
+    // MARK: - Hover (throttled, event-driven)
+
+    private func onMove() {
+        guard activeSlider == nil else { return }      // dragging → use locked ref
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastHover >= 0.08 else { return }  // cap ~12 Hz while moving
+        lastHover = now
+
+        let loc = NSEvent.mouseLocation
+        guard let primaryH = NSScreen.screens.first?.frame.height else { return }
+        let x = Float(loc.x), y = Float(primaryH - loc.y)
+
+        axQueue.async { [weak self] in
+            guard let self else { return }
+            var el: AXUIElement?
+            let found = (AXUIElementCopyElementAtPosition(self.sysWide, x, y, &el) == .success)
+                ? el.flatMap { self.sliderElement($0) } : nil
+            DispatchQueue.main.async {
+                guard self.activeSlider == nil, self.engineOn else { return }
+                self.hoveredSlider = found
+                self.status = found != nil ? "over a slider — grab it" : "on — drag a slider"
+            }
+        }
+    }
+
+    // MARK: - Drag lifecycle
+
+    private func onDown() {
+        guard let slider = hoveredSlider else { activeSlider = nil; return }
+        activeSlider = slider
+        readRange(slider)
+        if let v = readValue(slider) {
+            lastIndex = detentIndex(v)
+            valueText = String(format: "%.3f", v)
+        }
+        status = "🔒 tracking slider"
+    }
+
+    private func onDrag() {
+        guard let slider = activeSlider, let v = readValue(slider) else { return }
+        valueText = String(format: "%.3f", v)
+        let idx = detentIndex(v)
+        if idx != lastIndex {
+            lastIndex = idx
+            Haptics.fire(pattern)
+            tickCount += 1
+        }
+    }
+
+    private func onUp() {
+        activeSlider = nil
+        status = engineOn ? "on — drag a slider" : "off"
+    }
+
+    private func detentIndex(_ v: Double) -> Int {
+        let norm = maxV > minV ? (v - minV) / (maxV - minV) : v
+        return Int((norm * Double(detents)).rounded(.towardZero))
+    }
+
+    // MARK: - AX helpers
+
+    private func sliderElement(_ el: AXUIElement, maxDepth: Int = 5) -> AXUIElement? {
+        var current: AXUIElement? = el
+        var depth = 0
+        while let c = current, depth < maxDepth {
+            if role(of: c) == (kAXSliderRole as String) { return c }
+            var parent: CFTypeRef?
+            if AXUIElementCopyAttributeValue(c, kAXParentAttribute as CFString, &parent) == .success,
+               let p = parent, CFGetTypeID(p) == AXUIElementGetTypeID() {
+                current = (p as! AXUIElement)
+            } else {
+                current = nil
+            }
+            depth += 1
+        }
+        return nil
+    }
+
+    private func role(of el: AXUIElement) -> String? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &v) == .success,
+              let s = v as? String else { return nil }
+        return s
+    }
+
+    private func readValue(_ el: AXUIElement) -> Double? { readNumber(el, kAXValueAttribute) }
+
+    private func readRange(_ el: AXUIElement) {
+        minV = readNumber(el, kAXMinValueAttribute) ?? 0.0
+        maxV = readNumber(el, kAXMaxValueAttribute) ?? 1.0
+        if maxV <= minV { minV = 0.0; maxV = 1.0 }
+    }
+
+    private func readNumber(_ el: AXUIElement, _ attr: String) -> Double? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success,
+              let val = v, CFGetTypeID(val) == CFNumberGetTypeID() else { return nil }
+        var d = 0.0
+        CFNumberGetValue((val as! CFNumber), .doubleType, &d)
+        return d
+    }
+}
+
+// MARK: - Menu-bar control panel
+
+struct MenuContent: View {
+    @ObservedObject var engine: HapticEngine
+    @AppStorage("developerMode") private var developerMode = false
+    @AppStorage("menuIcon") private var menuIcon = "hand.point.up.braille"
+    @State private var launchAtLogin = false
+
+    /// Curated menu-bar icon choices (all valid SF Symbols, template-friendly).
+    private let iconOptions: [(symbol: String, label: String)] = [
+        ("slider.horizontal.3", "Slider"),
+        ("hand.tap", "Tap"),
+        ("hand.point.up.braille", "Braille"),
+        ("waveform", "Waveform"),
+        ("wave.3.right", "Waves"),
+        ("dot.radiowaves.left.and.right", "Signal"),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "hand.point.up.braille")
+                Text("Haptic Slider Control").font(.headline)
+                Spacer()
+                Circle()
+                    .fill(engine.engineOn ? Color.green : Color.secondary)
+                    .frame(width: 8, height: 8)
+            }
+
+            if !engine.trusted {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Accessibility access needed").font(.subheadline).bold()
+                    Text("Haptic Slider watches which slider you're dragging to add trackpad "
+                         + "feedback. It reads a slider's position only — never your content.")
+                        .font(.caption).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Grant Access…") { engine.requestTrust() }
+                        .buttonStyle(.borderedProminent)
+                }
+                .padding(10)
+                .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
+            }
+
+            Toggle("Enable slider haptics", isOn: Binding(
+                get: { engine.engineOn },
+                set: { engine.setEnabled($0) }))
+                .toggleStyle(.switch)
+                .disabled(!engine.trusted)
+
+            Picker("Feedback", selection: $engine.pattern) {
+                Text("Alignment").tag(NSHapticFeedbackManager.FeedbackPattern.alignment)
+                Text("Generic").tag(NSHapticFeedbackManager.FeedbackPattern.generic)
+                Text("Level").tag(NSHapticFeedbackManager.FeedbackPattern.levelChange)
+            }
+
+            HStack {
+                Text("Detents")
+                Spacer()
+                Picker("", selection: $engine.detents) {
+                    ForEach([8, 16, 24, 32], id: \.self) { Text("\($0)").tag($0) }
+                }
+                .pickerStyle(.segmented).labelsHidden().fixedSize()
+            }
+
+            Toggle("Launch at login", isOn: $launchAtLogin)
+                .onChange(of: launchAtLogin) { _, on in setLaunchAtLogin(on) }
+
+            HStack(spacing: 6) {
+                Text("Menu bar icon")
+                Spacer()
+                ForEach(iconOptions, id: \.symbol) { opt in
+                    Button { menuIcon = opt.symbol } label: {
+                        Image(systemName: opt.symbol)
+                            .frame(width: 26, height: 22)
+                            .background(menuIcon == opt.symbol ? Color.accentColor.opacity(0.25) : .clear,
+                                        in: RoundedRectangle(cornerRadius: 5))
+                    }
+                    .buttonStyle(.plain)
+                    .help(opt.label)
+                }
+            }
+
+            Divider()
+
+            Toggle("Developer Mode", isOn: $developerMode).font(.caption)
+            if developerMode { DiagnosticsView(engine: engine) }
+
+            Divider()
+
+            Button("Quit Haptic Slider") { NSApp.terminate(nil) }
+                .keyboardShortcut("q")
+        }
+        .padding(14)
+        .frame(width: 300)
+        .onAppear { launchAtLogin = (SMAppService.mainApp.status == .enabled) }
+    }
+
+    private func setLaunchAtLogin(_ on: Bool) {
+        do {
+            if on { try SMAppService.mainApp.register() }
+            else { try SMAppService.mainApp.unregister() }
+        } catch {
+            launchAtLogin = (SMAppService.mainApp.status == .enabled)
+        }
+    }
+}
+
+// MARK: - Developer Mode diagnostics (the old test harness)
+
+struct DiagnosticsView: View {
+    @ObservedObject var engine: HapticEngine
+
+    @State private var isBuzzing = false
+    @State private var buzzTimer: Timer?
+    @State private var burstIntervalMs = 80
+    @State private var burstTimer: Timer?
+    @State private var burstRemaining = 0
+    @State private var burstFired = 0
+    @State private var activityToken: NSObjectProtocol?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(engine.status).font(.caption2).foregroundStyle(.secondary)
+                Spacer()
+                Text("val \(engine.valueText)").font(.system(.caption2, design: .monospaced))
+                Text("ticks \(engine.tickCount)")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.green)
+            }
+
+            HStack(spacing: 6) {
+                Button("Generic") { Haptics.fire(.generic) }
+                Button("Align")   { Haptics.fire(.alignment) }
+                Button("Level")   { Haptics.fire(.levelChange) }
+            }
+            .buttonStyle(.bordered).controlSize(.small)
+
+            HStack(spacing: 8) {
+                Toggle("Buzz", isOn: $isBuzzing)
+                    .toggleStyle(.switch).controlSize(.mini)
+                    .onChange(of: isBuzzing) { _, on in on ? startBuzz() : stopBuzz() }
+                Picker("", selection: $burstIntervalMs) {
+                    ForEach([30, 50, 80, 120], id: \.self) { Text("\($0)").tag($0) }
+                }
+                .pickerStyle(.segmented).labelsHidden().fixedSize().controlSize(.small)
+                Button("Burst") { startBurst() }.disabled(burstRemaining > 0).controlSize(.small)
+                Text("\(burstFired)/12").font(.system(.caption2, design: .monospaced))
+            }
+        }
+        .padding(8)
+        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
+        .onDisappear { stopBuzz(); stopBurst() }
+    }
+
+    private func beginActivityIfNeeded() {
+        guard activityToken == nil else { return }
+        activityToken = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .latencyCritical], reason: "haptic timing")
+    }
+    private func endActivityIfIdle() {
+        guard buzzTimer == nil, burstTimer == nil, let token = activityToken else { return }
+        ProcessInfo.processInfo.endActivity(token)
+        activityToken = nil
+    }
+
+    private func startBuzz() {
+        stopBuzz(); beginActivityIfNeeded()
+        let timer = Timer(timeInterval: 1.5, repeats: true) { _ in Haptics.fire(.levelChange) }
+        timer.tolerance = 0
+        RunLoop.main.add(timer, forMode: .common)
+        buzzTimer = timer
+    }
+    private func stopBuzz() { buzzTimer?.invalidate(); buzzTimer = nil; endActivityIfIdle() }
+
+    private func startBurst() {
+        stopBurst(); beginActivityIfNeeded()
+        burstRemaining = 12; burstFired = 0
+        let timer = Timer(timeInterval: TimeInterval(burstIntervalMs) / 1000.0, repeats: true) { _ in
+            Haptics.fire(.levelChange)
+            withAnimation { burstFired += 1 }
+            burstRemaining -= 1
+            if burstRemaining <= 0 { stopBurst() }
+        }
+        timer.tolerance = 0
+        RunLoop.main.add(timer, forMode: .common)
+        burstTimer = timer
+    }
+    private func stopBurst() { burstTimer?.invalidate(); burstTimer = nil; burstRemaining = 0; endActivityIfIdle() }
 }
