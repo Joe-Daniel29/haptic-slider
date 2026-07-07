@@ -534,13 +534,10 @@ struct DiagnosticsView: View {
 
             Divider()
 
-            // Real, precise test sliders (driven by their own value, not Accessibility) —
-            // drag these to feel the effects without leaving the app.
-            Text("Try it — drag these").font(.caption2).foregroundStyle(.secondary)
-            HapticTestSlider(title: "Volume style — thud only at the ends",
-                             detented: false, engine: engine)
-            HapticTestSlider(title: "Detented — bumps + end thuds (like battery limit)",
-                             detented: true, engine: engine)
+            // A precise test slider (driven by its own value, not Accessibility) —
+            // drag it to feel detents + the end thud without leaving the app.
+            Text("Try it — drag this").font(.caption2).foregroundStyle(.secondary)
+            HapticTestSlider(engine: engine)
         }
         .padding(8)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
@@ -561,8 +558,6 @@ struct DiagnosticsView: View {
 /// In-app test slider. Because it owns its value, haptics fire on the exact value change
 /// (no Accessibility lag) — so the end thud never gets missed, even on a fast fling.
 struct HapticTestSlider: View {
-    let title: String
-    let detented: Bool
     @ObservedObject var engine: HapticEngine
 
     @State private var value = 0.5
@@ -570,14 +565,11 @@ struct HapticTestSlider: View {
     @State private var atEnd = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(title).font(.caption2).foregroundStyle(.tertiary)
-            Slider(value: $value, in: 0...1) { editing in
-                if editing { lastIdx = idx(value); atEnd = isEnd(value) }  // reset on grab
-            }
-            .controlSize(.small)
-            .onChange(of: value) { _, v in handle(v) }
+        Slider(value: $value, in: 0...1) { editing in
+            if editing { lastIdx = idx(value); atEnd = isEnd(value) }   // reset on grab
         }
+        .controlSize(.small)
+        .onChange(of: value) { _, v in handle(v) }
     }
 
     private func isEnd(_ v: Double) -> Bool { v <= 0.0005 || v >= 0.9995 }
@@ -589,7 +581,6 @@ struct HapticTestSlider: View {
             return
         }
         atEnd = false
-        guard detented else { return }
         let i = idx(v)
         if i != lastIdx { lastIdx = i; engine.fireDetent() }
     }
