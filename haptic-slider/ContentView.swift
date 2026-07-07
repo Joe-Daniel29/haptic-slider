@@ -387,23 +387,27 @@ struct MenuContent: View {
                 .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
             }
 
-            Toggle("Enable slider haptics", isOn: Binding(
-                get: { engine.engineOn },
-                set: { engine.setEnabled($0) }))
-                .toggleStyle(.switch)
-                .disabled(!engine.trusted)
-
-            Toggle("Strong pulse at ends (0 & max)", isOn: $engine.endpointPulse)
-                .toggleStyle(.switch)
-
-            Toggle("Launch at login", isOn: $launchAtLogin)
-                .toggleStyle(.switch)
-                .onChange(of: launchAtLogin) { _, on in setLaunchAtLogin(on) }
+            row("Enable slider haptics") {
+                Toggle("", isOn: Binding(get: { engine.engineOn },
+                                         set: { engine.setEnabled($0) }))
+                    .labelsHidden().toggleStyle(.switch).disabled(!engine.trusted)
+            }
+            row("Strong pulse at ends") {
+                Toggle("", isOn: $engine.endpointPulse)
+                    .labelsHidden().toggleStyle(.switch)
+            }
+            row("Launch at login") {
+                Toggle("", isOn: $launchAtLogin)
+                    .labelsHidden().toggleStyle(.switch)
+                    .onChange(of: launchAtLogin) { _, on in setLaunchAtLogin(on) }
+            }
 
             Divider()
 
-            Toggle("Developer Mode", isOn: $developerMode)
-                .toggleStyle(.switch).font(.caption)
+            row("Developer Mode") {
+                Toggle("", isOn: $developerMode)
+                    .labelsHidden().toggleStyle(.checkbox)
+            }
             if developerMode { DiagnosticsView(engine: engine) }
 
             Divider()
@@ -414,9 +418,21 @@ struct MenuContent: View {
                     .keyboardShortcut("q")
             }
         }
+        .controlSize(.small)
         .padding(14)
-        .frame(width: 300)
+        .frame(width: 280)
         .onAppear { launchAtLogin = (SMAppService.mainApp.status == .enabled) }
+    }
+
+    /// A settings row: label on the left, control flush to the right edge (macOS style).
+    @ViewBuilder
+    private func row<Control: View>(_ label: String,
+                                    @ViewBuilder _ control: () -> Control) -> some View {
+        HStack {
+            Text(label)
+            Spacer(minLength: 12)
+            control()
+        }
     }
 
     private func setLaunchAtLogin(_ on: Bool) {
