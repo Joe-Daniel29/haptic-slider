@@ -12,21 +12,14 @@ import AppKit
 struct haptic_sliderApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var engine = HapticEngine.shared
-    @AppStorage("menuIcon") private var menuIcon = "hand.point.up.braille"
 
     var body: some Scene {
         MenuBarExtra {
             MenuContent(engine: engine)
         } label: {
-            Image(systemName: safeIcon)
+            Image(systemName: "hand.point.up.braille")
         }
         .menuBarExtraStyle(.window)
-    }
-
-    /// Guard against an invalid symbol name blanking the menu bar.
-    private var safeIcon: String {
-        NSImage(systemSymbolName: menuIcon, accessibilityDescription: nil) != nil
-            ? menuIcon : "hand.point.up.braille"
     }
 }
 

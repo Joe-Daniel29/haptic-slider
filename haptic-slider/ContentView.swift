@@ -122,6 +122,7 @@ final class HapticEngine: ObservableObject {
     private var activeSlider: AXUIElement?
     private var lastIndex = 0
     private var atEndpoint = false
+    private var lastActuation: CFTimeInterval = 0
     private var minV = 0.0
     private var maxV = 1.0
 
@@ -243,41 +244,64 @@ final class HapticEngine: ObservableObject {
 
         if idx != lastIndex {
             lastIndex = idx
-            Haptics.fire(pattern)
+            fireDetent()
             tickCount += 1
         }
     }
 
     private func isAtEndpoint(_ v: Double) -> Bool {
         let norm = maxV > minV ? (v - minV) / (maxV - minV) : v
-        return norm <= 0.0005 || norm >= 0.9995
+        return norm <= 0.003 || norm >= 0.997
     }
 
-    /// The "hit the wall" feel at 0 / max. Uses the real Taptic waveform (the deep click)
-    /// via the private API; if that's unavailable, falls back to a tight public double-tap.
+    /// One detent tick. Routed through the engine so it knows when it last actuated.
+    func fireDetent() {
+        Haptics.fire(pattern)
+        lastActuation = CFAbsoluteTimeGetCurrent()
+    }
+
+    /// The "hit the wall" feel at 0 / max, using the real Taptic waveform (deep click) via
+    /// the private API. If a detent fired within the Taptic re-arm window, a fast fling
+    /// would otherwise swallow the thud — so hold it just long enough for the engine to be
+    /// ready. On the endpoint that ~45 ms is imperceptible but makes the thud reliable.
     func fireThud() {
-        if DeepHaptics.shared.actuate(Int32(endpointStyle)) { return }
-        Haptics.fire(.alignment)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.010) { Haptics.fire(.alignment) }
+        let since = CFAbsoluteTimeGetCurrent() - lastActuation
+        let play = { [weak self] in
+            guard let self else { return }
+            if !DeepHaptics.shared.actuate(Int32(self.endpointStyle)) {
+                Haptics.fire(.alignment)   // fallback when the private API is unavailable
+            }
+            self.lastActuation = CFAbsoluteTimeGetCurrent()
+        }
+        if since < 0.045 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + (0.045 - since), execute: play)
+        } else {
+            play()
+        }
     }
 
     private func onUp() {
-        // A fast fling often settles at the very end AFTER the last drag event fired
-        // (and AX value reads lag during quick motion), so re-check once the slider has
-        // come to rest — otherwise the endpoint thud gets missed.
         let slider = activeSlider
         let alreadyThudded = atEndpoint
         activeSlider = nil
         atEndpoint = false
         status = engineOn ? "on — drag a slider" : "off"
 
+        // A fast fling settles at the end AFTER the last drag event, and AX value reads
+        // lag during quick motion — so poll a few times as it comes to rest.
         if endpointPulse, !alreadyThudded, let slider {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
-                guard let self, self.engineOn else { return }
-                if let v = self.readValue(slider), self.isAtEndpoint(v) {
-                    self.fireThud()
-                    self.tickCount += 1
-                }
+            checkEndpointSettle(slider, attempt: 0)
+        }
+    }
+
+    private func checkEndpointSettle(_ slider: AXUIElement, attempt: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.035) { [weak self] in
+            guard let self, self.engineOn, self.activeSlider == nil else { return }
+            if let v = self.readValue(slider), self.isAtEndpoint(v) {
+                self.fireThud()
+                self.tickCount += 1
+            } else if attempt < 3 {
+                self.checkEndpointSettle(slider, attempt: attempt + 1)   // ~35/70/105/140ms
             }
         }
     }
@@ -336,18 +360,7 @@ final class HapticEngine: ObservableObject {
 struct MenuContent: View {
     @ObservedObject var engine: HapticEngine
     @AppStorage("developerMode") private var developerMode = false
-    @AppStorage("menuIcon") private var menuIcon = "hand.point.up.braille"
     @State private var launchAtLogin = false
-
-    /// Curated menu-bar icon choices (all valid SF Symbols, template-friendly).
-    private let iconOptions: [(symbol: String, label: String)] = [
-        ("slider.horizontal.3", "Slider"),
-        ("hand.tap", "Tap"),
-        ("hand.point.up.braille", "Braille"),
-        ("waveform", "Waveform"),
-        ("wave.3.right", "Waves"),
-        ("dot.radiowaves.left.and.right", "Signal"),
-    ]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -380,50 +393,22 @@ struct MenuContent: View {
                 .toggleStyle(.switch)
                 .disabled(!engine.trusted)
 
-            Picker("Feedback", selection: $engine.pattern) {
-                Text("Alignment").tag(NSHapticFeedbackManager.FeedbackPattern.alignment)
-                Text("Generic").tag(NSHapticFeedbackManager.FeedbackPattern.generic)
-                Text("Level").tag(NSHapticFeedbackManager.FeedbackPattern.levelChange)
-            }
-
-            HStack {
-                Text("Detents")
-                Spacer()
-                Picker("", selection: $engine.detents) {
-                    ForEach([8, 16, 24, 32], id: \.self) { Text("\($0)").tag($0) }
-                }
-                .pickerStyle(.segmented).labelsHidden().fixedSize()
-            }
-
             Toggle("Strong pulse at ends (0 & max)", isOn: $engine.endpointPulse)
+                .toggleStyle(.switch)
 
             Toggle("Launch at login", isOn: $launchAtLogin)
+                .toggleStyle(.switch)
                 .onChange(of: launchAtLogin) { _, on in setLaunchAtLogin(on) }
-
-            HStack(spacing: 6) {
-                Text("Menu bar icon")
-                Spacer()
-                ForEach(iconOptions, id: \.symbol) { opt in
-                    Button { menuIcon = opt.symbol } label: {
-                        Image(systemName: opt.symbol)
-                            .frame(width: 26, height: 22)
-                            .background(menuIcon == opt.symbol ? Color.accentColor.opacity(0.25) : .clear,
-                                        in: RoundedRectangle(cornerRadius: 5))
-                    }
-                    .buttonStyle(.plain)
-                    .help(opt.label)
-                }
-            }
 
             Divider()
 
-            Toggle("Developer Mode", isOn: $developerMode).font(.caption)
+            Toggle("Developer Mode", isOn: $developerMode)
+                .toggleStyle(.switch).font(.caption)
             if developerMode { DiagnosticsView(engine: engine) }
 
             Divider()
 
             HStack {
-                Button("Setup Guide") { (NSApp.delegate as? AppDelegate)?.showWelcome() }
                 Spacer()
                 Button("Quit") { NSApp.terminate(nil) }
                     .keyboardShortcut("q")
@@ -500,100 +485,112 @@ struct WelcomeView: View {
 struct DiagnosticsView: View {
     @ObservedObject var engine: HapticEngine
 
-    @State private var isBuzzing = false
-    @State private var buzzTimer: Timer?
-    @State private var burstIntervalMs = 80
-    @State private var burstTimer: Timer?
-    @State private var burstRemaining = 0
-    @State private var burstFired = 0
-    @State private var activityToken: NSObjectProtocol?
+    private let waveforms: [(id: Int, name: String)] = [
+        (1, "1 · weak"), (2, "2 · deep"), (3, "3 · buzz"),
+        (4, "4 · light"), (5, "5 · medium"), (6, "6 · strong"),
+    ]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(engine.status).font(.caption2).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 10) {
+            Text("DEVELOPER").font(.caption2.bold()).foregroundStyle(.tertiary)
+
+            // Live state — confirms the engine is detecting a slider and firing.
+            HStack(spacing: 6) {
+                Circle().fill(engine.engineOn ? Color.green : Color.secondary)
+                    .frame(width: 6, height: 6)
+                Text(engine.status).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                 Spacer()
                 Text("val \(engine.valueText)").font(.system(.caption2, design: .monospaced))
-                Text("ticks \(engine.tickCount)")
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.green)
+                Text("· \(engine.tickCount)")
+                    .font(.system(.caption2, design: .monospaced)).foregroundStyle(.green)
             }
-
-            HStack(spacing: 6) {
-                Button("Generic") { Haptics.fire(.generic) }
-                Button("Align")   { Haptics.fire(.alignment) }
-                Button("Level")   { Haptics.fire(.levelChange) }
-            }
-            .buttonStyle(.bordered).controlSize(.small)
-
-            HStack(spacing: 6) {
-                Text("End waveform").font(.caption2).foregroundStyle(.secondary)
-                Picker("", selection: $engine.endpointStyle) {
-                    Text("1 · weak").tag(1)
-                    Text("2 · strong (deep)").tag(2)
-                    Text("3 · buzz").tag(3)
-                    Text("4 · light").tag(4)
-                    Text("5 · medium").tag(5)
-                    Text("6 · strong tap").tag(6)
-                }
-                .labelsHidden().fixedSize().controlSize(.small)
-                Button("Test") { engine.fireThud() }.controlSize(.small)
-            }
-            Text(DeepHaptics.shared.available
-                 ? "Deep haptics: ON (real Taptic waveforms)"
-                 : "Deep haptics: unavailable — using fallback")
+            Text(DeepHaptics.shared.available ? "Deep haptics: ON" : "Deep haptics: off — public fallback")
                 .font(.caption2)
                 .foregroundStyle(DeepHaptics.shared.available ? .green : .orange)
 
-            HStack(spacing: 8) {
-                Toggle("Buzz", isOn: $isBuzzing)
-                    .toggleStyle(.switch).controlSize(.mini)
-                    .onChange(of: isBuzzing) { _, on in on ? startBuzz() : stopBuzz() }
-                Picker("", selection: $burstIntervalMs) {
-                    ForEach([30, 50, 80, 120], id: \.self) { Text("\($0)").tag($0) }
+            Divider()
+
+            // Tuning — moved here from the main panel. Label left, control right.
+            settingRow("Feedback") {
+                Picker("", selection: $engine.pattern) {
+                    Text("Alignment").tag(NSHapticFeedbackManager.FeedbackPattern.alignment)
+                    Text("Generic").tag(NSHapticFeedbackManager.FeedbackPattern.generic)
+                    Text("Level").tag(NSHapticFeedbackManager.FeedbackPattern.levelChange)
+                }
+                .labelsHidden().fixedSize().controlSize(.small)
+            }
+            settingRow("Detents") {
+                Picker("", selection: $engine.detents) {
+                    ForEach([8, 16, 24, 32], id: \.self) { Text("\($0)").tag($0) }
                 }
                 .pickerStyle(.segmented).labelsHidden().fixedSize().controlSize(.small)
-                Button("Burst") { startBurst() }.disabled(burstRemaining > 0).controlSize(.small)
-                Text("\(burstFired)/12").font(.system(.caption2, design: .monospaced))
             }
+            settingRow("Thud waveform") {
+                Picker("", selection: $engine.endpointStyle) {
+                    ForEach(waveforms, id: \.id) { Text($0.name).tag($0.id) }
+                }
+                .labelsHidden().fixedSize().controlSize(.small)
+            }
+
+            Divider()
+
+            // Real, precise test sliders (driven by their own value, not Accessibility) —
+            // drag these to feel the effects without leaving the app.
+            Text("Try it — drag these").font(.caption2).foregroundStyle(.secondary)
+            HapticTestSlider(title: "Volume style — thud only at the ends",
+                             detented: false, engine: engine)
+            HapticTestSlider(title: "Detented — bumps + end thuds (like battery limit)",
+                             detented: true, engine: engine)
         }
         .padding(8)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
-        .onDisappear { stopBuzz(); stopBurst() }
     }
 
-    private func beginActivityIfNeeded() {
-        guard activityToken == nil else { return }
-        activityToken = ProcessInfo.processInfo.beginActivity(
-            options: [.userInitiated, .latencyCritical], reason: "haptic timing")
-    }
-    private func endActivityIfIdle() {
-        guard buzzTimer == nil, burstTimer == nil, let token = activityToken else { return }
-        ProcessInfo.processInfo.endActivity(token)
-        activityToken = nil
-    }
-
-    private func startBuzz() {
-        stopBuzz(); beginActivityIfNeeded()
-        let timer = Timer(timeInterval: 1.5, repeats: true) { _ in Haptics.fire(.levelChange) }
-        timer.tolerance = 0
-        RunLoop.main.add(timer, forMode: .common)
-        buzzTimer = timer
-    }
-    private func stopBuzz() { buzzTimer?.invalidate(); buzzTimer = nil; endActivityIfIdle() }
-
-    private func startBurst() {
-        stopBurst(); beginActivityIfNeeded()
-        burstRemaining = 12; burstFired = 0
-        let timer = Timer(timeInterval: TimeInterval(burstIntervalMs) / 1000.0, repeats: true) { _ in
-            Haptics.fire(.levelChange)
-            withAnimation { burstFired += 1 }
-            burstRemaining -= 1
-            if burstRemaining <= 0 { stopBurst() }
+    /// A settings row: caption label on the left, control flush right.
+    @ViewBuilder
+    private func settingRow<Control: View>(_ label: String,
+                                           @ViewBuilder _ control: () -> Control) -> some View {
+        HStack {
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+            Spacer()
+            control()
         }
-        timer.tolerance = 0
-        RunLoop.main.add(timer, forMode: .common)
-        burstTimer = timer
     }
-    private func stopBurst() { burstTimer?.invalidate(); burstTimer = nil; burstRemaining = 0; endActivityIfIdle() }
+}
+
+/// In-app test slider. Because it owns its value, haptics fire on the exact value change
+/// (no Accessibility lag) — so the end thud never gets missed, even on a fast fling.
+struct HapticTestSlider: View {
+    let title: String
+    let detented: Bool
+    @ObservedObject var engine: HapticEngine
+
+    @State private var value = 0.5
+    @State private var lastIdx = -1
+    @State private var atEnd = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(title).font(.caption2).foregroundStyle(.tertiary)
+            Slider(value: $value, in: 0...1) { editing in
+                if editing { lastIdx = idx(value); atEnd = isEnd(value) }  // reset on grab
+            }
+            .controlSize(.small)
+            .onChange(of: value) { _, v in handle(v) }
+        }
+    }
+
+    private func isEnd(_ v: Double) -> Bool { v <= 0.0005 || v >= 0.9995 }
+    private func idx(_ v: Double) -> Int { Int((v * Double(engine.detents)).rounded(.towardZero)) }
+
+    private func handle(_ v: Double) {
+        if isEnd(v) {
+            if !atEnd { atEnd = true; engine.fireThud() }
+            return
+        }
+        atEnd = false
+        guard detented else { return }
+        let i = idx(v)
+        if i != lastIdx { lastIdx = i; engine.fireDetent() }
+    }
 }
