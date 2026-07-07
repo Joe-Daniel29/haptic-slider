@@ -96,7 +96,7 @@ final class HapticEngine: ObservableObject {
     @Published var pattern: NSHapticFeedbackManager.FeedbackPattern = .alignment {
         didSet { UserDefaults.standard.set(pattern.rawValue, forKey: "pattern") }
     }
-    @Published var detents = 16 {
+    @Published var detents = 32 {
         didSet { UserDefaults.standard.set(detents, forKey: "detents") }
     }
     @Published var endpointPulse = true {
@@ -262,8 +262,24 @@ final class HapticEngine: ObservableObject {
     }
 
     private func onUp() {
+        // A fast fling often settles at the very end AFTER the last drag event fired
+        // (and AX value reads lag during quick motion), so re-check once the slider has
+        // come to rest — otherwise the endpoint thud gets missed.
+        let slider = activeSlider
+        let alreadyThudded = atEndpoint
         activeSlider = nil
+        atEndpoint = false
         status = engineOn ? "on — drag a slider" : "off"
+
+        if endpointPulse, !alreadyThudded, let slider {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+                guard let self, self.engineOn else { return }
+                if let v = self.readValue(slider), self.isAtEndpoint(v) {
+                    self.fireThud()
+                    self.tickCount += 1
+                }
+            }
+        }
     }
 
     private func detentIndex(_ v: Double) -> Int {
