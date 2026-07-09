@@ -7,6 +7,7 @@
 
 import SwiftUI
 import AppKit
+import ApplicationServices
 
 @main
 struct haptic_sliderApp: App {
@@ -41,13 +42,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         _ = HapticEngine.shared   // spin up the engine
-        if !UserDefaults.standard.bool(forKey: "didOnboard") {
+
+        // Show setup on first run — and on ANY launch where we can't function because
+        // Accessibility access is missing. That second clause is the reinstall case:
+        // `didOnboard` lives in UserDefaults (~/Library/Preferences), which survives
+        // deleting the app, but the Accessibility grant usually does not. Without it a
+        // reinstall would launch silently into a menu-bar icon that does nothing.
+        if !UserDefaults.standard.bool(forKey: "didOnboard") || !AXIsProcessTrusted() {
             // Defer to next runloop tick so the app is ready to front a window.
             DispatchQueue.main.async { [weak self] in self?.showWelcome() }
         }
     }
 
-    /// Show (or re-show) the welcome / setup window. Also reachable from the menu.
+    /// Show (or re-show) the welcome / setup window. Also reachable from the menu
+    /// panel's "Setup Guide…" button.
     func showWelcome() {
         if welcomeWindow == nil {
             let host = NSHostingController(rootView: WelcomeView { [weak self] in self?.finishOnboarding() })
