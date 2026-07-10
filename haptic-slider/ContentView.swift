@@ -360,6 +360,7 @@ final class HapticEngine: ObservableObject {
 struct MenuContent: View {
     @ObservedObject var engine: HapticEngine
     @AppStorage("developerMode") private var developerMode = false
+    @AppStorage("menuIconStyle") private var menuIconStyle = "hand"
     @State private var launchAtLogin = false
 
     var body: some View {
@@ -400,6 +401,18 @@ struct MenuContent: View {
                 Toggle("", isOn: $launchAtLogin)
                     .labelsHidden().toggleStyle(.switch)
                     .onChange(of: launchAtLogin) { _, on in setLaunchAtLogin(on) }
+            }
+            row("Menu bar icon") {
+                Picker("", selection: $menuIconStyle) {
+                    Image(systemName: "hand.point.up.braille").tag("hand")
+                    Text("Blank").tag("blank")
+                }
+                .pickerStyle(.segmented).labelsHidden().fixedSize().controlSize(.small)
+            }
+            if menuIconStyle == "blank" {
+                Text("The icon turns invisible but keeps its spot — click the same place in the menu bar to open this panel.")
+                    .font(.caption2).foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Divider()

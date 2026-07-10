@@ -12,12 +12,25 @@ import AppKit
 struct haptic_sliderApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var engine = HapticEngine.shared
+    @AppStorage("menuIconStyle") private var menuIconStyle = "hand"
+
+    /// A transparent, menu-bar-sized template image — the "blank" icon option.
+    /// The extra keeps its slot and stays clickable; it just draws nothing.
+    static let blankMenuIcon: NSImage = {
+        let img = NSImage(size: NSSize(width: 18, height: 18))
+        img.isTemplate = true
+        return img
+    }()
 
     var body: some Scene {
         MenuBarExtra {
             MenuContent(engine: engine)
         } label: {
-            Image(systemName: "hand.point.up.braille")
+            if menuIconStyle == "blank" {
+                Image(nsImage: Self.blankMenuIcon)
+            } else {
+                Image(systemName: "hand.point.up.braille")
+            }
         }
         .menuBarExtraStyle(.window)
     }
