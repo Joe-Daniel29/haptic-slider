@@ -70,34 +70,55 @@ struct DetentTracker {
         atEndpoint = isEndpoint(v)
     }
 
+    /// Everything one value-step decided — what fired and why/why not.
+    /// Consumed by the engine's diagnostics log; `update` keeps the simple API.
+    struct Outcome {
+        var event: Event?
+        var index: Int
+        var previousIndex: Int?
+        var boundariesCrossed: Int      // |idx − last| when a move registered, else 0
+        var hysteresisSuppressed: Bool  // a crossing happened but jitter-filtering ate it
+        var fraction: Double            // position within the current detent, 0…1
+    }
+
     /// Feed a new value; returns the haptic event it warrants, if any.
     mutating func update(_ v: Double, endpointPulse: Bool) -> Event? {
+        step(v, endpointPulse: endpointPulse).event
+    }
+
+    /// Like `update`, but reports the full decision for diagnostics.
+    mutating func step(_ v: Double, endpointPulse: Bool) -> Outcome {
         let p = norm(v) * Double(detents)
         let idx = min(detents - 1, Int(p.rounded(.towardZero)))
         // Fraction into the current detent (1.0 when pinned at max, so the top
         // detent isn't permanently suppressed by the hysteresis check below).
         let frac = p >= Double(detents) ? 1.0 : p - p.rounded(.down)
+        var out = Outcome(event: nil, index: idx, previousIndex: lastIndex,
+                          boundariesCrossed: 0, hysteresisSuppressed: false, fraction: frac)
 
         // Endpoints (0.000 / max): a firm "thud", fired once on arrival.
         if endpointPulse && isEndpoint(v) {
             if !atEndpoint {
                 atEndpoint = true
+                out.boundariesCrossed = lastIndex.map { abs(idx - $0) } ?? 0
                 lastIndex = idx
-                return .endpoint
+                out.event = .endpoint
             }
-            return nil
+            return out
         }
         atEndpoint = false
 
         guard let last = lastIndex else {
             lastIndex = idx
-            return nil
+            return out
         }
-        guard idx != last else { return nil }
+        guard idx != last else { return out }
         // Adjacent-detent hysteresis: barely past the boundary is jitter, not a move.
-        if idx == last + 1, frac < Self.hysteresis { return nil }
-        if idx == last - 1, frac > 1 - Self.hysteresis { return nil }
+        if idx == last + 1, frac < Self.hysteresis { out.hysteresisSuppressed = true; return out }
+        if idx == last - 1, frac > 1 - Self.hysteresis { out.hysteresisSuppressed = true; return out }
+        out.boundariesCrossed = abs(idx - last)
         lastIndex = idx
-        return .detent
+        out.event = .detent
+        return out
     }
 }

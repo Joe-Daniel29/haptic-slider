@@ -173,6 +173,7 @@ final class HapticEngine: ObservableObject {
         scrollTracker = nil
         keySlider = nil
         keyTracker = nil
+        pendingTicks = 0
         engineOn = false
         status = "off"
         valueText = "—"
@@ -217,6 +218,7 @@ final class HapticEngine: ObservableObject {
             return
         }
         activeSlider = slider
+        pendingTicks = 0   // a fresh grab never inherits queued ticks
         // A hung target app must not stall us mid-drag beyond 50 ms per read.
         AXUIElementSetMessagingTimeout(slider, 0.05)
         var tracker = makeTracker(for: slider)
@@ -227,11 +229,26 @@ final class HapticEngine: ObservableObject {
         dragTracker = tracker
         installObserver(on: slider)
         status = "🔒 tracking slider"
+
+        // Identify this drag in the diagnostics log.
+        var pid: pid_t = 0
+        AXUIElementGetPid(slider, &pid)
+        DiagLog.shared.log([
+            "ev": "grab", "src": "drag",
+            "app": NSRunningApplication(processIdentifier: pid)?.localizedName ?? "pid \(pid)",
+            "desc": readString(slider, kAXDescriptionAttribute)
+                ?? readString(slider, kAXTitleAttribute) ?? "?",
+            "min": tracker.minV, "max": tracker.maxV,
+            "len": readLength(slider) ?? -1,
+            "detents": tracker.detents,
+            "v0": readValue(slider) ?? -1,
+            "observer": axObserver != nil,
+        ])
     }
 
     private func onDrag() {
-        guard let slider = activeSlider, let v = readValue(slider) else { return }
-        process(&dragTracker, v)
+        guard let slider = activeSlider, let v = readValueLogged(slider, src: "drag") else { return }
+        process(&dragTracker, v, src: "drag")
     }
 
     private func onUp() {
@@ -240,6 +257,7 @@ final class HapticEngine: ObservableObject {
         let alreadyThudded = dragTracker?.atEndpoint ?? false
         activeSlider = nil
         status = engineOn ? "on — drag a slider" : "off"
+        DiagLog.shared.log(["ev": "release", "ticksTotal": tickCount])
 
         // A fast fling settles at the end AFTER the last drag event. The AXObserver
         // keeps pushing value changes, so leave it (and the tracker) alive briefly.
@@ -259,7 +277,7 @@ final class HapticEngine: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.035) { [weak self] in
             guard let self, self.engineOn, self.activeSlider == nil, self.dragTracker != nil else { return }
             if let v = self.readValue(slider) {
-                self.process(&self.dragTracker, v)
+                self.process(&self.dragTracker, v, src: "settle")
                 if self.dragTracker?.atEndpoint == true { return }
             }
             if attempt < 3 {
@@ -296,8 +314,8 @@ final class HapticEngine: ObservableObject {
     }
 
     private func observedValueChanged(_ element: AXUIElement) {
-        guard engineOn, dragTracker != nil, let v = readValue(element) else { return }
-        process(&dragTracker, v)
+        guard engineOn, dragTracker != nil, let v = readValueLogged(element, src: "ax") else { return }
+        process(&dragTracker, v, src: "ax")
     }
 
     // MARK: - Scroll wheel over a hovered slider
@@ -313,7 +331,7 @@ final class HapticEngine: ObservableObject {
             let v = self.readValue(slider)
             DispatchQueue.main.async {
                 guard self.engineOn, self.activeSlider == nil, let v else { return }
-                self.process(&self.scrollTracker, v)
+                self.process(&self.scrollTracker, v, src: "scroll")
             }
         }
     }
@@ -351,7 +369,7 @@ final class HapticEngine: ObservableObject {
                     self.keySlider = el
                     self.keyTracker = t
                 } else if let v {
-                    self.process(&self.keyTracker, v)
+                    self.process(&self.keyTracker, v, src: "key")
                 }
             }
         }
@@ -360,15 +378,74 @@ final class HapticEngine: ObservableObject {
     // MARK: - Detent firing
 
     /// Feed a value through a tracker and fire whatever it warrants.
-    private func process(_ tracker: inout DetentTracker?, _ v: Double) {
+    /// Every sample — fired or not — lands in the diagnostics log with the
+    /// tracker's full decision, so skipped ticks can be diagnosed per slider.
+    private func process(_ tracker: inout DetentTracker?, _ v: Double, src: String) {
         guard var t = tracker else { return }
-        let event = t.update(v, endpointPulse: endpointPulse)
+        let out = t.step(v, endpointPulse: endpointPulse)
         tracker = t
         valueText = String(format: "%.3f", v)
-        switch event {
-        case .detent:   fireDetent(); tickCount += 1
-        case .endpoint: fireThud();   tickCount += 1
-        case nil:       break
+
+        let fired: String
+        switch out.event {
+        case .detent:
+            // Sparse value streams (Control Centre volume/keyboard update at
+            // ~half the rate of brightness) cross 2–3 boundaries per sample.
+            // Every crossed boundary earns a tick — the scheduler spaces them.
+            enqueueTicks(max(1, out.boundariesCrossed))
+            fired = "detent"
+        case .endpoint:
+            pendingTicks = 0   // the wall supersedes any queued detents
+            fireThud(); tickCount += 1
+            fired = "endpoint"
+        case nil:
+            fired = out.hysteresisSuppressed ? "hysteresis-skip" : "none"
+        }
+        DiagLog.shared.log([
+            "ev": "sample", "src": src, "v": v,
+            "idx": out.index, "prev": out.previousIndex ?? -1,
+            "crossed": out.boundariesCrossed,
+            "frac": (out.fraction * 1000).rounded() / 1000,
+            "fired": fired,
+        ])
+    }
+
+    // MARK: - Tick scheduler
+    //
+    // Fires one tick per crossed detent boundary, never closer together than
+    // `tickSpacing` — merged crossings become distinct taps instead of one,
+    // and bursty streams get an even rhythm. The backlog is capped so a
+    // click-teleport across the track can't queue a buzz.
+
+    private var pendingTicks = 0
+    private var tickDrainScheduled = false
+    private let tickSpacing: CFTimeInterval = 0.022   // just above the actuator blur threshold
+    private let maxPendingTicks = 3
+
+    private func enqueueTicks(_ n: Int) {
+        pendingTicks = min(pendingTicks + n, maxPendingTicks)
+        drainTicks()
+    }
+
+    private func drainTicks() {
+        guard !tickDrainScheduled, pendingTicks > 0 else { return }
+        let since = CFAbsoluteTimeGetCurrent() - lastActuation
+        if since >= tickSpacing {
+            pendingTicks -= 1
+            fireDetent()
+            tickCount += 1
+            if pendingTicks > 0 { scheduleDrain(after: tickSpacing) }
+        } else {
+            scheduleDrain(after: tickSpacing - since)
+        }
+    }
+
+    private func scheduleDrain(after delay: CFTimeInterval) {
+        tickDrainScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.tickDrainScheduled = false
+            self.drainTicks()
         }
     }
 
@@ -435,6 +512,28 @@ final class HapticEngine: ObservableObject {
     }
 
     private func readValue(_ el: AXUIElement) -> Double? { readNumber(el, kAXValueAttribute) }
+
+    /// Like `readValue`, but a failed read lands in the diagnostics log with its
+    /// AXError — dropped reads are invisible otherwise, and they're the current
+    /// suspect for skipped ticks (timeout while the target app is busy).
+    private func readValueLogged(_ el: AXUIElement, src: String) -> Double? {
+        var v: CFTypeRef?
+        let err = AXUIElementCopyAttributeValue(el, kAXValueAttribute as CFString, &v)
+        guard err == .success, let val = v, CFGetTypeID(val) == CFNumberGetTypeID() else {
+            DiagLog.shared.log(["ev": "readfail", "src": src, "err": Int(err.rawValue)])
+            return nil
+        }
+        var d = 0.0
+        CFNumberGetValue((val as! CFNumber), .doubleType, &d)
+        return d
+    }
+
+    private func readString(_ el: AXUIElement, _ attr: String) -> String? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, attr as CFString, &v) == .success,
+              let s = v as? String, !s.isEmpty else { return nil }
+        return s
+    }
 
     private func readNumber(_ el: AXUIElement, _ attr: String) -> Double? {
         var v: CFTypeRef?
